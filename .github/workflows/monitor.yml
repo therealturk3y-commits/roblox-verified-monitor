@@ -1,0 +1,50 @@
+name: Roblox Verified Monitor
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 350
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          CURRENT_USERS_CHANNEL_ID: ${{ secrets.CURRENT_USERS_CHANNEL_ID }}
+          NEW_USERS_CHANNEL_ID: ${{ secrets.NEW_USERS_CHANNEL_ID }}
+        run: python monitor.py
+
+      - name: Save database
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add processed_users.json
+
+          if git diff --cached --quiet; then
+            echo "No database changes."
+          else
+            git commit -m "Update user database"
+            git push
+          fi
