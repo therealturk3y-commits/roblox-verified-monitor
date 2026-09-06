@@ -11,66 +11,93 @@ BASE_URL = "https://robloxverifieds.com/verified"
 STATE_FILE = "processed_users.json"
 
 PAGE_SIZE = int(os.getenv("PAGE_SIZE", "25"))
-PAGE_DELAY = float(os.getenv("PAGE_DELAY", "2"))
-MESSAGE_DELAY = float(os.getenv("MESSAGE_DELAY", "1.5"))
+PAGE_DELAY = float(os.getenv("PAGE_DELAY", "1.5"))
 
 BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 CURRENT_CHANNEL = os.environ["CURRENT_USERS_CHANNEL_ID"]
 NEW_CHANNEL = os.environ["NEW_USERS_CHANNEL_ID"]
 
 session = requests.Session()
-session.headers["User-Agent"] = (
-    "Mozilla/5.0 (compatible; RobloxVerifiedMonitor/1.0)"
-)
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (compatible; RobloxVerifiedMonitor/1.0)"
+})
 
+
+# --------------------------------------------------
+# DATABASE
+# --------------------------------------------------
 
 def load_ids():
     try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            return set(map(str, json.load(f)))
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return set(str(x) for x in json.load(f))
     except (FileNotFoundError, json.JSONDecodeError):
         return set()
 
 
 def save_ids(ids):
-    temp = STATE_FILE + ".tmp"
+    temp_file = STATE_FILE + ".tmp"
 
-    with open(temp, "w", encoding="utf-8") as f:
+    with open(temp_file, "w", encoding="utf-8") as f:
         json.dump(sorted(ids), f, indent=2)
 
-    os.replace(temp, STATE_FILE)
+    os.replace(temp_file, STATE_FILE)
 
 
-def discord_send(channel_id, embed):
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+# --------------------------------------------------
+# DISCORD
+# --------------------------------------------------
+
+def send_discord_message(channel_id, embeds):
+    """
+    Discord allows up to 10 embeds in one message.
+    """
+
+    url = (
+        f"https://discord.com/api/v10/"
+        f"channels/{channel_id}/messages"
+    )
 
     headers = {
         "Authorization": f"Bot {BOT_TOKEN}",
         "Content-Type": "application/json"
     }
 
+    payload = {
+        "embeds": embeds
+    }
+
     while True:
         response = requests.post(
             url,
             headers=headers,
-            json={"embeds": [embed]},
-            timeout=30
+            json=payload,
+            timeout=60
         )
 
         if response.status_code == 429:
             try:
-                wait = float(
+                retry_after = float(
                     response.json().get("retry_after", 5)
                 )
             except Exception:
-                wait = 5
+                retry_after = 5
 
-            time.sleep(wait)
+            print(
+                f"Discord rate limit. "
+                f"Waiting {retry_after:.2f}s..."
+            )
+
+            time.sleep(retry_after)
             continue
 
         response.raise_for_status()
         return
 
+
+# --------------------------------------------------
+# WEBSITE
+# --------------------------------------------------
 
 def get_page(page):
     while True:
@@ -81,17 +108,21 @@ def get_page(page):
                     "page": page,
                     "sort": "name_asc"
                 },
-                timeout=30
+                timeout=45
             )
 
             if response.status_code == 429:
+                print("Website rate limited. Waiting 60 seconds...")
                 time.sleep(60)
                 continue
 
             response.raise_for_status()
+
             return response.text
 
-        except requests.RequestException:
+        except requests.RequestException as e:
+            print(f"Page {page} request failed: {e}")
+            print("Retrying in 15 seconds...")
             time.sleep(15)
 
 
@@ -99,15 +130,21 @@ def parse_users(html):
     soup = BeautifulSoup(html, "html.parser")
 
     users = []
-    seen = set()
+    seen_ids = set()
 
-    for link in soup.find_all(
+    # Roblox Verifieds user pages appear as /user/<ID>
+    links = soup.find_all(
         "a",
         href=re.compile(r"^/user/\d+$")
-    ):
+    )
+
+    for link in links:
+
+        href = link.get("href", "")
+
         match = re.search(
             r"/user/(\d+)",
-            link.get("href", "")
+            href
         )
 
         if not match:
@@ -115,10 +152,10 @@ def parse_users(html):
 
         user_id = match.group(1)
 
-        if user_id in seen:
+        if user_id in seen_ids:
             continue
 
-        seen.add(user_id)
+        seen_ids.add(user_id)
 
         text = link.get_text(
             " ",
@@ -130,24 +167,23 @@ def parse_users(html):
             text
         )
 
-        username = (
-            username_match.group(1)
-            if username_match
-            else text.split()[0]
-            if text
-            else user_id
-        )
+        if username_match:
+            username = username_match.group(1)
+            display_name = text.split("@", 1)[0].strip()
+        else:
+            username = text.strip()
+            display_name = text.strip()
 
-        display_name = (
-            text.split("@", 1)[0].strip()
-            if "@" in text
-            else text
-        )
+        if not username:
+            username = user_id
+
+        if not display_name:
+            display_name = username
 
         users.append({
             "id": user_id,
             "username": username,
-            "display": display_name or username,
+            "display": display_name,
             "profile":
                 f"https://www.roblox.com/users/{user_id}/profile"
         })
@@ -155,7 +191,12 @@ def parse_users(html):
     return users
 
 
+# --------------------------------------------------
+# ROBLOX AVATAR
+# --------------------------------------------------
+
 def get_avatar(user_id):
+
     try:
         response = requests.get(
             "https://thumbnails.roblox.com/v1/users/avatar-headshot",
@@ -175,16 +216,24 @@ def get_avatar(user_id):
         if data:
             return data[0].get("imageUrl")
 
-    except Exception:
-        pass
+    except Exception as e:
+        print(
+            f"Could not get avatar for {user_id}: {e}"
+        )
 
     return None
 
 
-def make_embed(user, title):
+# --------------------------------------------------
+# EMBEDS
+# --------------------------------------------------
+
+def create_embed(user, title):
+
     embed = {
         "title": title,
         "url": user["profile"],
+
         "fields": [
             {
                 "name": "Username",
@@ -208,8 +257,10 @@ def make_embed(user, title):
                     f"({user['profile']})"
             }
         ],
+
         "timestamp":
             datetime.now(timezone.utc).isoformat(),
+
         "footer": {
             "text": "Roblox Verified Monitor"
         }
@@ -225,101 +276,222 @@ def make_embed(user, title):
     return embed
 
 
-def scan():
-    known = load_ids()
+# --------------------------------------------------
+# INITIAL POPULATION
+# --------------------------------------------------
 
-    # Empty database = first scan
-    first_scan = len(known) == 0
+def initial_population(users, known):
 
-    discovered = []
+    print()
+    print("======================================")
+    print(" INITIAL POPULATION")
+    print("======================================")
+    print(f"Users found: {len(users)}")
+    print()
 
+    # Discord supports a maximum of 10 embeds/message.
+    batch = []
+
+    total = len(users)
+
+    for index, user in enumerate(users, start=1):
+
+        print(
+            f"Preparing {index}/{total}: "
+            f"@{user['username']}"
+        )
+
+        embed = create_embed(
+            user,
+            "👤 Current Verified Roblox User"
+        )
+
+        batch.append(embed)
+
+        known.add(user["id"])
+
+        # Send every 10 users
+        if len(batch) == 10:
+
+            send_discord_message(
+                CURRENT_CHANNEL,
+                batch
+            )
+
+            print(
+                f"Sent batch "
+                f"{index - len(batch) + 1}-{index}"
+            )
+
+            batch = []
+
+    # Send remaining users
+    if batch:
+        send_discord_message(
+            CURRENT_CHANNEL,
+            batch
+        )
+
+        print(
+            f"Sent final batch "
+            f"({len(batch)} users)"
+        )
+
+    save_ids(known)
+
+    print()
+    print(
+        f"Initial population complete: "
+        f"{len(known)} users"
+    )
+
+
+# --------------------------------------------------
+# FUTURE SCANS
+# --------------------------------------------------
+
+def check_for_new_users(users, known):
+
+    new_users = []
+
+    for user in users:
+
+        if user["id"] in known:
+            continue
+
+        new_users.append(user)
+
+    print()
+    print(
+        f"New users detected: "
+        f"{len(new_users)}"
+    )
+
+    for user in new_users:
+
+        print(
+            f"NEW: @{user['username']} "
+            f"({user['id']})"
+        )
+
+        embed = create_embed(
+            user,
+            "🟢 New Verified Roblox User"
+        )
+
+        send_discord_message(
+            NEW_CHANNEL,
+            [embed]
+        )
+
+        # Only mark it known after Discord accepted it.
+        known.add(user["id"])
+
+    if new_users:
+        save_ids(known)
+
+
+# --------------------------------------------------
+# SCAN ALL PAGES
+# --------------------------------------------------
+
+def scan_all_pages():
+
+    all_users = []
     page = 1
 
     while True:
-        print(f"Scanning page {page}...")
+
+        print(
+            f"Scanning page {page}..."
+        )
 
         html = get_page(page)
+
         users = parse_users(html)
 
         print(
-            f"Found {len(users)} users on page {page}"
+            f"Page {page}: "
+            f"{len(users)} users"
         )
 
+        # Empty page = end
         if not users:
             break
 
-        discovered.extend(users)
+        # Prevent duplicate users across pages
+        existing = {
+            user["id"]
+            for user in all_users
+        }
 
-        # Last page
+        for user in users:
+
+            if user["id"] not in existing:
+                all_users.append(user)
+
+        # If this page is not full,
+        # it is the last page.
         if len(users) < PAGE_SIZE:
+            print(
+                f"Page {page} is not full. "
+                f"Reached final page."
+            )
             break
 
         page += 1
 
         time.sleep(PAGE_DELAY)
 
-    # -----------------------------------------
-    # FIRST SCAN
-    # -----------------------------------------
+    return all_users
 
-    if first_scan:
-        print(
-            f"Initial scan: {len(discovered)} users"
-        )
 
-        for user in discovered:
-            discord_send(
-                CURRENT_CHANNEL,
-                make_embed(
-                    user,
-                    "👤 Current Verified Roblox User"
-                )
-            )
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
 
-            known.add(user["id"])
-            save_ids(known)
+def main():
 
-            time.sleep(MESSAGE_DELAY)
+    print()
+    print("======================================")
+    print(" ROBLOX VERIFIED MONITOR")
+    print("======================================")
+    print()
 
-        print("Initial population complete.")
-        return
-
-    # -----------------------------------------
-    # FUTURE SCANS
-    # -----------------------------------------
-
-    new_count = 0
-
-    for user in discovered:
-
-        if user["id"] in known:
-            continue
-
-        print(
-            f"NEW USER: @{user['username']}"
-        )
-
-        discord_send(
-            NEW_CHANNEL,
-            make_embed(
-                user,
-                "🟢 New Verified Roblox User"
-            )
-        )
-
-        known.add(user["id"])
-
-        save_ids(known)
-
-        new_count += 1
-
-        time.sleep(MESSAGE_DELAY)
+    known = load_ids()
 
     print(
-        f"Scan complete. "
-        f"New users: {new_count}"
+        f"Known users in database: "
+        f"{len(known)}"
     )
+
+    users = scan_all_pages()
+
+    print()
+    print(
+        f"Total users discovered: "
+        f"{len(users)}"
+    )
+
+    # Empty database = first scan
+    if not known:
+
+        initial_population(
+            users,
+            known
+        )
+
+    else:
+
+        check_for_new_users(
+            users,
+            known
+        )
+
+    print()
+    print("Scan finished.")
+    print()
 
 
 if __name__ == "__main__":
-    scan()
+    main()
