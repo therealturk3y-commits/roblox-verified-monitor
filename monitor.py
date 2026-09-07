@@ -8,7 +8,9 @@ import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://robloxverifieds.com/verified"
+
 STATE_FILE = "processed_users.json"
+INITIALIZED_FILE = "current_users_initialized.json"
 
 PAGE_SIZE = int(os.getenv("PAGE_SIZE", "25"))
 PAGE_DELAY = float(os.getenv("PAGE_DELAY", "1.5"))
@@ -23,9 +25,9 @@ session.headers.update({
 })
 
 
-# --------------------------------------------------
+# ==================================================
 # DATABASE
-# --------------------------------------------------
+# ==================================================
 
 def load_ids():
     try:
@@ -44,14 +46,23 @@ def save_ids(ids):
     os.replace(temp_file, STATE_FILE)
 
 
-# --------------------------------------------------
+def is_initialized():
+    return os.path.exists(INITIALIZED_FILE)
+
+
+def mark_initialized():
+    with open(INITIALIZED_FILE, "w", encoding="utf-8") as f:
+        json.dump({
+            "initialized": True,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }, f, indent=2)
+
+
+# ==================================================
 # DISCORD
-# --------------------------------------------------
+# ==================================================
 
 def send_discord_message(channel_id, embeds):
-    """
-    Discord allows up to 10 embeds in one message.
-    """
 
     url = (
         f"https://discord.com/api/v10/"
@@ -68,38 +79,45 @@ def send_discord_message(channel_id, embeds):
     }
 
     while True:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=60
-        )
-
-        if response.status_code == 429:
-            try:
-                retry_after = float(
-                    response.json().get("retry_after", 5)
-                )
-            except Exception:
-                retry_after = 5
-
-            print(
-                f"Discord rate limit. "
-                f"Waiting {retry_after:.2f}s..."
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=60
             )
 
-            time.sleep(retry_after)
-            continue
+            if response.status_code == 429:
+                try:
+                    retry_after = float(
+                        response.json().get("retry_after", 5)
+                    )
+                except Exception:
+                    retry_after = 5
 
-        response.raise_for_status()
-        return
+                print(
+                    f"Discord rate limit. "
+                    f"Waiting {retry_after:.2f}s..."
+                )
+
+                time.sleep(retry_after)
+                continue
+
+            response.raise_for_status()
+            return
+
+        except requests.RequestException as e:
+            print(f"Discord request failed: {e}")
+            print("Retrying in 15 seconds...")
+            time.sleep(15)
 
 
-# --------------------------------------------------
+# ==================================================
 # WEBSITE
-# --------------------------------------------------
+# ==================================================
 
 def get_page(page):
+
     while True:
         try:
             response = session.get(
@@ -112,7 +130,10 @@ def get_page(page):
             )
 
             if response.status_code == 429:
-                print("Website rate limited. Waiting 60 seconds...")
+                print(
+                    "Website rate limited. "
+                    "Waiting 60 seconds..."
+                )
                 time.sleep(60)
                 continue
 
@@ -121,18 +142,20 @@ def get_page(page):
             return response.text
 
         except requests.RequestException as e:
-            print(f"Page {page} request failed: {e}")
+            print(
+                f"Page {page} request failed: {e}"
+            )
             print("Retrying in 15 seconds...")
             time.sleep(15)
 
 
 def parse_users(html):
+
     soup = BeautifulSoup(html, "html.parser")
 
     users = []
     seen_ids = set()
 
-    # Roblox Verifieds user pages appear as /user/<ID>
     links = soup.find_all(
         "a",
         href=re.compile(r"^/user/\d+$")
@@ -191,9 +214,9 @@ def parse_users(html):
     return users
 
 
-# --------------------------------------------------
+# ==================================================
 # ROBLOX AVATAR
-# --------------------------------------------------
+# ==================================================
 
 def get_avatar(user_id):
 
@@ -224,9 +247,9 @@ def get_avatar(user_id):
     return None
 
 
-# --------------------------------------------------
+# ==================================================
 # EMBEDS
-# --------------------------------------------------
+# ==================================================
 
 def create_embed(user, title):
 
@@ -276,20 +299,19 @@ def create_embed(user, title):
     return embed
 
 
-# --------------------------------------------------
-# INITIAL POPULATION
-# --------------------------------------------------
+# ==================================================
+# INITIAL CURRENT USERS
+# ==================================================
 
 def initial_population(users, known):
 
     print()
     print("======================================")
-    print(" INITIAL POPULATION")
+    print(" INITIAL CURRENT USER POPULATION")
     print("======================================")
     print(f"Users found: {len(users)}")
     print()
 
-    # Discord supports a maximum of 10 embeds/message.
     batch = []
 
     total = len(users)
@@ -310,7 +332,6 @@ def initial_population(users, known):
 
         known.add(user["id"])
 
-        # Send every 10 users
         if len(batch) == 10:
 
             send_discord_message(
@@ -319,36 +340,43 @@ def initial_population(users, known):
             )
 
             print(
-                f"Sent batch "
-                f"{index - len(batch) + 1}-{index}"
+                f"Sent current-user batch "
+                f"ending at {index}/{total}"
             )
 
             batch = []
 
-    # Send remaining users
+            # Small delay to be friendly to Discord
+            time.sleep(1)
+
     if batch:
+
         send_discord_message(
             CURRENT_CHANNEL,
             batch
         )
 
         print(
-            f"Sent final batch "
+            f"Sent final current-user batch "
             f"({len(batch)} users)"
         )
 
     save_ids(known)
 
+    # Only mark initialized after the entire
+    # current-user population succeeded.
+    mark_initialized()
+
     print()
     print(
-        f"Initial population complete: "
-        f"{len(known)} users"
+        f"Current-user population complete: "
+        f"{len(users)} users"
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # FUTURE SCANS
-# --------------------------------------------------
+# ==================================================
 
 def check_for_new_users(users, known):
 
@@ -384,16 +412,15 @@ def check_for_new_users(users, known):
             [embed]
         )
 
-        # Only mark it known after Discord accepted it.
         known.add(user["id"])
 
     if new_users:
         save_ids(known)
 
 
-# --------------------------------------------------
+# ==================================================
 # SCAN ALL PAGES
-# --------------------------------------------------
+# ==================================================
 
 def scan_all_pages():
 
@@ -415,11 +442,9 @@ def scan_all_pages():
             f"{len(users)} users"
         )
 
-        # Empty page = end
         if not users:
             break
 
-        # Prevent duplicate users across pages
         existing = {
             user["id"]
             for user in all_users
@@ -430,13 +455,13 @@ def scan_all_pages():
             if user["id"] not in existing:
                 all_users.append(user)
 
-        # If this page is not full,
-        # it is the last page.
         if len(users) < PAGE_SIZE:
+
             print(
                 f"Page {page} is not full. "
                 f"Reached final page."
             )
+
             break
 
         page += 1
@@ -446,9 +471,9 @@ def scan_all_pages():
     return all_users
 
 
-# --------------------------------------------------
+# ==================================================
 # MAIN
-# --------------------------------------------------
+# ==================================================
 
 def main():
 
@@ -465,6 +490,11 @@ def main():
         f"{len(known)}"
     )
 
+    print(
+        f"Current-user initialization: "
+        f"{'COMPLETE' if is_initialized() else 'NOT COMPLETE'}"
+    )
+
     users = scan_all_pages()
 
     print()
@@ -473,8 +503,11 @@ def main():
         f"{len(users)}"
     )
 
-    # Empty database = first scan
-    if not known:
+    # IMPORTANT:
+    # This is now based on a separate initialization
+    # marker rather than whether processed_users.json
+    # is empty.
+    if not is_initialized():
 
         initial_population(
             users,
